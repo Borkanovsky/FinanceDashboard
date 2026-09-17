@@ -17,14 +17,6 @@ A mobile financial analysis app built with React Native. Search any publicly tra
 - react-native-chart-kit
 - React Navigation
 
-## Screenshots
-![alt text](../../IMG_0908.png)
- ![alt text](IMG_0902.png)
-![alt text](IMG_0901.png)
-![alt text](IMG_0904.png)
-![alt text](IMG_0906.png)
-![alt text](IMG_0907.png)
-![alt text](IMG_0903.png)
 ## Setup
 
 See [SETUP.md](./SETUP.md) for detailed installation instructions.
