@@ -2,14 +2,15 @@
 
 A mobile stock analysis app built with React Native and Expo. Search any US-listed company to see its price history, five years of financial statements, 20 financial ratios, and an interactive discounted cash flow (DCF) valuation.
 
-<!-- DEMO VIDEO: on github.com, click the pencil icon to edit this file, delete this
-     comment, and drag your demo .mp4 onto this spot. GitHub will insert the video link. -->
+
+https://github.com/user-attachments/assets/9b3e882d-03c5-4fa2-be68-616744c9b078 
+
 
 ## Screenshots
 
-| Search | Overview | Ratios | DCF |
-|---|---|---|---|
-| <img src="screenshots/search.png" width="200"> | <img src="screenshots/overview.png" width="200"> | <img src="screenshots/ratios.png" width="200"> | <img src="screenshots/dcf.png" width="200"> |
+| Search | Overview | Ratios | DCF | sheets |
+|---|---|---|---| --- |
+| <img src="screenshots/search.png" width="200"> | <img src="screenshots/overview.png" width="200"> | <img src="screenshots/ratios.png" width="200"> | <img src="screenshots/dcf.png" width="200"> | <img src="screenshots/sheets.png" width="200"> 
 
 ## Features
 
