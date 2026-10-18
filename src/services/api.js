@@ -1,72 +1,131 @@
 // api.js
-// Central API service layer. Every screen that needs financial data calls
-// functions from this file. No screen ever constructs a URL or makes an
-// HTTP request directly.
+// Central API service layer. Every screen gets financial data through the
+// functions in this file; no screen ever builds a URL or calls axios itself.
 //
 // WHY THIS ARCHITECTURE:
-// If FMP changes their API structure again (they already did once, moving
-// from /api/v3/ to /stable/), you change THIS file only. Every screen
-// keeps working because they call searchTicker() and getCompanyProfile(),
-// not raw HTTP endpoints. This separation is called the "service layer"
-// pattern and it's how professional codebases are organized.
+// FMP has already changed its API once (from /api/v3/ to /stable/). Because
+// screens call getCompanyProfile() instead of raw URLs, a change like that is
+// fixed in THIS file only. This is the "service layer" pattern.
 //
 // FMP API MIGRATION NOTE (2025):
-// FMP deprecated all /api/v3/ endpoints in August 2025. New accounts
-// must use the /stable/ endpoints. The key differences:
+// FMP deprecated the /api/v3/ endpoints in August 2025. The differences:
 //   OLD: https://financialmodelingprep.com/api/v3/profile/AAPL?apikey=KEY
 //   NEW: https://financialmodelingprep.com/stable/profile?symbol=AAPL&apikey=KEY
-// Path parameters (/AAPL) became query parameters (?symbol=AAPL).
-// Some endpoint names also changed (e.g., /search became /search-symbol).
+// Path parameters (/AAPL) became query parameters (?symbol=AAPL), some
+// endpoint names changed (/search → /search-symbol), and many FIELD NAMES
+// changed too (mktCap → marketCap, peRatio → priceToEarningsRatio, etc.).
 //
 // ERROR HANDLING STRATEGY:
-// Every function wraps its HTTP call in try/catch. On failure, it logs the
-// error to the console (visible in your terminal where expo is running)
-// and returns null or an empty array. Each screen checks for null and
-// shows an error message to the user instead of crashing.
+// No function here ever throws. List endpoints return [] on failure and
+// single-record endpoints return null. Screens check for those values and show
+// an error message. Returning [] (not null) for lists matters because screens
+// call .map() on the result, and [].map() is safe while null.map() crashes.
 //
 // COMMON ERRORS:
-// - 401: Your API key is invalid or missing. Check config.js.
-// - 403: You've exceeded the free tier limits (250 requests/day).
-// - 429: Too many requests too fast. Add a small delay between calls.
-// - "Legacy Endpoint": You're using /api/v3/ URLs. Use /stable/ instead.
-// - Network Error: No internet, or phone and computer on different Wi-Fi.
+// - 401: API key invalid or missing. Check config.js.
+// - 402: The endpoint (or parameter) needs a paid FMP plan.
+// - 429: Rate limit hit (free tier is about 250 requests/day). Wait and retry.
+// - "Legacy Endpoint": an old /api/v3/ URL. Use /stable/ instead.
+// - Network Error / timeout: no internet, or phone and computer on different Wi-Fi.
 
-// axios is an HTTP client library. It makes GET/POST requests and
-// automatically parses JSON responses. We use it instead of the built-in
-// fetch() because axios has cleaner error handling and automatically
-// throws on non-200 status codes (fetch doesn't).
 import axios from 'axios';
-
-// Import the base URL and API key from our centralized config file.
-// This means if the API key changes or FMP migrates URLs again,
-// we update config.js and everything here picks it up automatically.
 import config from '../constants/config';
 
-// Destructure the values we need from config. This is shorthand for:
-//   const FMP_BASE_URL = config.FMP_BASE_URL;
-//   const FMP_API_KEY = config.FMP_API_KEY;
 const { FMP_BASE_URL, FMP_API_KEY } = config;
 
-// Helper function that constructs a complete API URL from an endpoint
-// path and optional additional query parameters.
-//
-// HOW IT WORKS:
-// Every FMP request needs the apikey parameter. This function appends it
-// automatically so individual API functions never have to remember to
-// include it. If there are additional parameters (like symbol=AAPL or
-// limit=5), they get appended after the apikey with an & separator.
-//
-// EXAMPLE:
-// buildUrl('/profile', 'symbol=AAPL')
-// Returns: "https://financialmodelingprep.com/stable/profile?apikey=YOUR_KEY&symbol=AAPL"
-//
-// buildUrl('/stock-list')
-// Returns: "https://financialmodelingprep.com/stable/stock-list?apikey=YOUR_KEY"
+// A dedicated axios client with a timeout. Without one, a dropped connection
+// leaves the request pending forever and the screen spins indefinitely.
+const http = axios.create({ timeout: 10000 });
+// The most recent failure for each API function, keyed by function name.
+// Screens read this (via getApiError) to explain WHY data is missing,
+// without changing the [] / null return values they already rely on.
+const apiErrors = {};
+
+/**
+ * Returns the first recorded error among the given API functions.
+ *
+ * @param {...string} labels Function names, e.g. 'getRatios', 'getKeyMetrics'.
+ * @returns {{status?: number, detail?: string, message?: string}|null}
+ */
+export const getApiError = (...labels) => labels.map((l) => apiErrors[l]).find(Boolean) || null;
+/**
+ * Builds a full FMP URL with the API key attached.
+ *
+ * Every request needs `apikey`, so it's added here once instead of in every
+ * function (forgetting it is the #1 cause of 401 errors).
+ *
+ * @param {string} endpoint  Path after the base URL, e.g. "/profile".
+ * @param {string} [params]  Extra query string WITHOUT a leading "&",
+ *                           e.g. "symbol=AAPL&limit=5". Values must already be
+ *                           URL-encoded.
+ * @returns {string} The complete request URL.
+ */
 const buildUrl = (endpoint, params = '') => {
-  // If there are extra params, we need an & to separate them from the apikey.
-  // If there are no extra params, we add nothing after the apikey.
   const separator = params ? '&' : '';
   return `${FMP_BASE_URL}${endpoint}?apikey=${FMP_API_KEY}${separator}${params}`;
+};
+
+/**
+ * URL-encodes a ticker for use in a query string.
+ * Tickers like "BRK.B" are safe as-is, but anything with a space, "&" or "#"
+ * (pasted text, unusual international symbols) would otherwise break the URL
+ * or inject extra parameters.
+ *
+ * @param {string} ticker Raw ticker symbol.
+ * @returns {string} Encoded symbol.
+ */
+const encodeTicker = (ticker) => encodeURIComponent(String(ticker || '').trim());
+
+/**
+ * Normalizes a list response to an array.
+ *
+ * FMP sometimes answers with HTTP 200 and an error OBJECT, e.g.
+ * { "Error Message": "Invalid API KEY" }. The old `response.data || []`
+ * passed that object through, and the screen crashed calling .map() on it.
+ *
+ * @param {*} data       response.data from axios.
+ * @param {string} label Function name, used in the log message.
+ * @returns {Array} The data if it's an array, otherwise [].
+ */
+const asArray = (data, label) => {
+  delete apiErrors[label];
+  if (Array.isArray(data)) return data;
+  if (data && typeof data === 'object') {
+    console.error(`${label}: unexpected response`, data['Error Message'] || data);
+  }
+  return [];
+};
+
+/**
+ * Returns the first record of a list response, or null.
+ * FMP wraps single-company endpoints (profile, ratios…) in an array.
+ *
+ * @param {*} data       response.data from axios.
+ * @param {string} label Function name, used in the log message.
+ * @returns {Object|null} First element, or null if the list is empty/invalid.
+ */
+const firstOrNull = (data, label) => {
+  const list = asArray(data, label);
+  return list.length > 0 ? list[0] : null;
+};
+
+/**
+ * Logs a failed request without leaking the API key.
+ * axios's error.message doesn't include the URL, but error.config.url does,
+ * so we deliberately log only the message and HTTP status.
+ *
+ * @param {string} label Function name.
+ * @param {Error & {response?: {status?: number}}} error The axios error.
+ * @returns {void}
+ */
+const logError = (label, error) => {
+  const status = error?.response?.status;
+  // FMP's response body explains 401/402/429 in plain English and never
+  // contains the API key, so it's safe to log and show.
+  const body = error?.response?.data;
+  const detail = typeof body === 'string' ? body : body?.['Error Message'] || body?.message;
+  apiErrors[label] = { status, detail, message: error?.message };
+  console.error(`${label} error:`, status ? `HTTP ${status}` : '', error?.message, detail || '');
 };
 
 
@@ -74,55 +133,50 @@ const buildUrl = (endpoint, params = '') => {
 // SEARCH
 // ============================================================
 
-// Searches for companies matching the user's input text.
-// Called by: SearchScreen.js (fires as the user types, after debounce)
-//
-// ENDPOINT: /stable/search-symbol?query=AAPL&apikey=KEY
-// (Old v3 endpoint was: /api/v3/search?query=AAPL)
-//
-// PARAMETERS:
-// - query: string. The text the user typed. Can be a ticker symbol
-//   ("AAPL"), a partial ticker ("AA"), or a company name ("Apple").
-//
-// RETURNS: Array of objects, each with:
-//   { symbol: "AAPL", name: "Apple Inc.", currency: "USD",
-//     stockExchange: "NASDAQ Global Select", exchangeShortName: "NASDAQ" }
-//
-// The function returns an empty array (not null) on failure because
-// SearchScreen maps over the results with .map(). Mapping over [] works
-// fine and renders nothing. Mapping over null would crash the app.
-//
-// GUARD CLAUSE:
-// If the query is empty or just whitespace, return [] immediately
-// without making an API call. This prevents wasting a request when
-// the user clears the search field.
+/**
+ * Searches for companies matching what the user typed.
+ * Called by SearchScreen (after the debounce delay).
+ *
+ * ENDPOINT: /stable/search-symbol?query=AAPL
+ *
+ * @param {string} query Ticker, partial ticker, or company name ("AAPL", "Apple").
+ * @returns {Promise<Array<{symbol: string, name: string, currency: string,
+ *   exchange: string, exchangeFullName: string}>>} Matches, or [] on failure or
+ *   empty input. (The old v3 field `exchangeShortName` is `exchange` in /stable/.)
+ */
 export const searchTicker = async (query) => {
-  // Don't call the API for empty or whitespace-only queries.
   if (!query || query.trim().length === 0) return [];
+  const q = query.trim();
 
-  try {
-    // encodeURIComponent handles special characters in the query.
-    // If the user types "AT&T", it becomes "AT%26T" in the URL,
-    // which prevents the & from being interpreted as a parameter separator.
-    const url = buildUrl('/search-symbol', `query=${encodeURIComponent(query)}`);
+  // FMP writes share classes with a dash (BRK-B), but people type BRK.B.
+  const symbolQuery = q.replace(/\./g, '-');
 
-    // axios.get() makes an HTTP GET request and waits for the response.
-    // The "await" keyword pauses this function until the response arrives.
-    // While paused, the rest of the app keeps running (JavaScript is async).
-    const response = await axios.get(url);
+  // Runs one search and never throws, so one failing search
+  // can't wipe out the results of the other.
+  const safeSearch = async (endpoint, text) => {
+    try {
+      const response = await http.get(buildUrl(endpoint, `query=${encodeURIComponent(text)}`));
+      return asArray(response.data, 'searchTicker');
+    } catch (error) {
+      logError('searchTicker', error);
+      return [];
+    }
+  };
 
-    // response.data is the parsed JSON body from FMP's server.
-    // If it exists, return it. If it's null/undefined for some reason,
-    // return an empty array as a safe fallback.
-    return response.data || [];
-  } catch (error) {
-    // Log the error so you can see it in the terminal for debugging.
-    // error.message contains the human-readable error description.
-    // Common messages: "Request failed with status code 401",
-    // "Network Error", "timeout of 0ms exceeded"
-    console.error('searchTicker error:', error.message);
-    return [];
-  }
+  // search-symbol only matches tickers ("AAPL"); search-name matches company
+  // names ("Apple", "AT&T"). Run both at once and merge, so either works.
+  const [bySymbol, byName] = await Promise.all([
+    safeSearch('/search-symbol', symbolQuery),
+    safeSearch('/search-name', q),
+  ]);
+
+  // The same company often appears in both lists, so drop repeats.
+  const seen = new Set();
+  return [...bySymbol, ...byName].filter((item) => {
+    if (!item?.symbol || seen.has(item.symbol)) return false;
+    seen.add(item.symbol);
+    return true;
+  });
 };
 
 
@@ -130,51 +184,28 @@ export const searchTicker = async (query) => {
 // COMPANY PROFILE
 // ============================================================
 
-// Fetches a company's basic information and current market data.
-// Called by: OverviewScreen.js (when the screen first loads)
-// Also called by: DCFScreen.js (to get the current stock price)
-//
-// ENDPOINT: /stable/profile?symbol=AAPL&apikey=KEY
-// (Old v3 endpoint was: /api/v3/profile/AAPL)
-//
-// PARAMETERS:
-// - ticker: string. The stock ticker symbol, e.g., "AAPL", "MSFT", "TSLA".
-//
-// RETURNS: A single object (not an array) with fields including:
-//   - companyName: "Apple Inc."
-//   - symbol: "AAPL"
-//   - price: 178.72 (current stock price as a number)
-//   - changes: -1.23 (daily price change in dollars, negative = down)
-//   - changesPercentage: "-0.68%" (NOTE: sometimes a string with %,
-//     sometimes a number. OverviewScreen handles both cases.)
-//   - mktCap: 2800000000000 (market cap in raw dollars)
-//   - sector: "Technology"
-//   - industry: "Consumer Electronics"
-//   - exchangeShortName: "NASDAQ"
-//   - range: "124.17-198.23" (52-week range as a hyphenated string.
-//     Split on "-" to get low and high values.)
-//   - description: "Apple Inc. designs, manufactures..." (full text)
-//   - image: "https://..." (URL to company logo)
-//   - volAvg: 54000000 (average daily trading volume)
-//
-// WHY [0]:
-// FMP returns an array even though we're requesting one company.
-// response.data is [{ ...profile }]. We return response.data[0]
-// to give the calling screen a plain object instead of an array.
-// This simplifies usage: profile.companyName instead of profile[0].companyName.
+/**
+ * Fetches a company's profile and current market data.
+ * Called by OverviewScreen and DCFScreen (for the current price).
+ *
+ * ENDPOINT: /stable/profile?symbol=AAPL
+ *
+ * Fields used by the app (/stable/ names):
+ *   companyName, symbol, price, change (daily $ change),
+ *   changePercentage (number OR string like "-0.68%"; OverviewScreen handles both),
+ *   marketCap, sector, industry, exchange, range ("124.17-198.23"),
+ *   averageVolume, description, image.
+ *
+ * @param {string} ticker Stock symbol, e.g. "AAPL".
+ * @returns {Promise<Object|null>} The profile object, or null if the ticker
+ *   doesn't exist (FMP returns an empty array) or the request fails.
+ */
 export const getCompanyProfile = async (ticker) => {
   try {
-    const url = buildUrl('/profile', `symbol=${ticker}`);
-    const response = await axios.get(url);
-
-    // Check that we got data AND that the array has at least one element.
-    // If the ticker doesn't exist (e.g., "ZZZZ"), FMP returns an empty array.
-    if (response.data && response.data.length > 0) {
-      return response.data[0];
-    }
-    return null;
+    const response = await http.get(buildUrl('/profile', `symbol=${encodeTicker(ticker)}`));
+    return firstOrNull(response.data, 'getCompanyProfile');
   } catch (error) {
-    console.error('getCompanyProfile error:', error.message);
+    logError('getCompanyProfile', error);
     return null;
   }
 };
@@ -184,188 +215,126 @@ export const getCompanyProfile = async (ticker) => {
 // FINANCIAL STATEMENTS
 // ============================================================
 
-// Fetches annual income statement data for the last N years.
-// Called by: FinancialsScreen.js (Income Statement tab)
-//
-// ENDPOINT: /stable/income-statement?symbol=AAPL&limit=5&apikey=KEY
-// (Old v3 endpoint was: /api/v3/income-statement/AAPL?limit=5)
-//
-// RETURNS: Array of objects, one per fiscal year, NEWEST FIRST.
-//
-// KEY FIELDS IN EACH OBJECT:
-//   - date: "2023-09-30" (fiscal year end date)
-//   - revenue: 383285000000 (total sales)
-//   - grossProfit: 169148000000 (revenue minus cost of goods sold)
-//   - operatingIncome: 114301000000 (profit from core operations)
-//   - netIncome: 96995000000 (bottom line profit after all expenses)
-//   - ebitda: 125820000000 (earnings before interest, taxes, depreciation,
-//     and amortization. Used as a proxy for operating cash generation.)
-//   - eps: 6.13 (earnings per share)
-//
-// IMPORTANT: Data arrives NEWEST FIRST. The FinancialsScreen reverses
-// the array with .reverse() before displaying charts, so charts read
-// left-to-right chronologically (2019, 2020, 2021, 2022, 2023).
-//
-// The limit parameter comes from config.FINANCIAL_YEARS (default 5).
-// This fetches 5 years of annual data. FMP supports up to 30+ years
-// on paid plans, but 5 is standard for analysis.
-export const getIncomeStatement = async (ticker) => {
+/**
+ * Shared fetcher for the three annual statements, which use identical
+ * parameters and response shapes.
+ *
+ * @param {string} endpoint FMP statement endpoint.
+ * @param {string} ticker   Stock symbol.
+ * @param {string} label    Function name for logging.
+ * @returns {Promise<Object[]>} One object per fiscal year, NEWEST FIRST, or [].
+ */
+const fetchStatement = async (endpoint, ticker, label) => {
   try {
-    const url = buildUrl(
-      '/income-statement',
-      `symbol=${ticker}&limit=${config.FINANCIAL_YEARS}`
-    );
-    const response = await axios.get(url);
-    return response.data || [];
+    const url = buildUrl(endpoint, `symbol=${encodeTicker(ticker)}&limit=${config.FINANCIAL_YEARS}`);
+    const response = await http.get(url);
+    return asArray(response.data, label);
   } catch (error) {
-    console.error('getIncomeStatement error:', error.message);
+    logError(label, error);
     return [];
   }
 };
 
-// Fetches annual balance sheet data.
-// Called by: FinancialsScreen.js (Balance Sheet tab)
-// Also called by: DCFScreen.js (to calculate net debt)
-//
-// ENDPOINT: /stable/balance-sheet-statement?symbol=AAPL&limit=5&apikey=KEY
-// (Old v3 endpoint was: /api/v3/balance-sheet-statement/AAPL?limit=5)
-//
-// KEY FIELDS:
-//   - totalAssets: everything the company owns
-//   - totalLiabilities: everything the company owes
-//   - totalStockholdersEquity: assets minus liabilities (book value)
-//   - totalDebt: all interest-bearing debt (loans, bonds)
-//   - cashAndCashEquivalents: cash on hand
-//   - netDebt: totalDebt minus cash. Used in DCF to convert enterprise
-//     value to equity value. If negative, the company has more cash
-//     than debt (common for tech companies like Apple).
-//   - totalCurrentAssets / totalCurrentLiabilities: for working capital
-export const getBalanceSheet = async (ticker) => {
-  try {
-    const url = buildUrl(
-      '/balance-sheet-statement',
-      `symbol=${ticker}&limit=${config.FINANCIAL_YEARS}`
-    );
-    const response = await axios.get(url);
-    return response.data || [];
-  } catch (error) {
-    console.error('getBalanceSheet error:', error.message);
-    return [];
-  }
-};
+/**
+ * Fetches annual income statements (default: last 5 years).
+ * Called by FinancialsScreen.
+ *
+ * ENDPOINT: /stable/income-statement?symbol=AAPL&limit=5
+ * Key fields: date, revenue, grossProfit, operatingIncome, netIncome, ebitda, eps.
+ *
+ * Data arrives NEWEST FIRST; FinancialsScreen reverses it so charts read
+ * left-to-right in time order.
+ *
+ * @param {string} ticker Stock symbol.
+ * @returns {Promise<Object[]>} Yearly income statements, or [] on failure.
+ */
+export const getIncomeStatement = (ticker) =>
+  fetchStatement('/income-statement', ticker, 'getIncomeStatement');
 
-// Fetches annual cash flow statement data.
-// Called by: FinancialsScreen.js (Cash Flow tab)
-// Also called by: DCFScreen.js (to get Free Cash Flow for the DCF model)
-//
-// ENDPOINT: /stable/cash-flow-statement?symbol=AAPL&limit=5&apikey=KEY
-// (Old v3 endpoint was: /api/v3/cash-flow-statement/AAPL?limit=5)
-//
-// KEY FIELDS:
-//   - operatingCashFlow: cash generated from running the business
-//   - capitalExpenditure: money spent on equipment/buildings (NEGATIVE number)
-//   - freeCashFlow: operatingCashFlow + capitalExpenditure
-//     (capex is negative, so this = operating cash flow minus capex)
-//   - dividendsPaid: cash returned to shareholders (NEGATIVE number)
-//
-// FREE CASH FLOW (FCF) is the most critical number for the DCF calculator.
-// It represents the cash left over after a company pays for its operations
-// and maintains its physical assets. This is the cash available to pay
-// debt, buy back stock, make acquisitions, or distribute to owners.
-// PE firms care about FCF above almost every other metric because it
-// determines how quickly they can pay down the debt used to buy a company.
-export const getCashFlow = async (ticker) => {
-  try {
-    const url = buildUrl(
-      '/cash-flow-statement',
-      `symbol=${ticker}&limit=${config.FINANCIAL_YEARS}`
-    );
-    const response = await axios.get(url);
-    return response.data || [];
-  } catch (error) {
-    console.error('getCashFlow error:', error.message);
-    return [];
-  }
-};
+/**
+ * Fetches annual balance sheets.
+ * Called by FinancialsScreen and DCFScreen (to compute net debt).
+ *
+ * ENDPOINT: /stable/balance-sheet-statement?symbol=AAPL&limit=5
+ * Key fields: totalAssets, totalLiabilities, totalStockholdersEquity,
+ * totalDebt, cashAndCashEquivalents, netDebt.
+ *
+ * @param {string} ticker Stock symbol.
+ * @returns {Promise<Object[]>} Yearly balance sheets, newest first, or [].
+ */
+export const getBalanceSheet = (ticker) =>
+  fetchStatement('/balance-sheet-statement', ticker, 'getBalanceSheet');
+
+/**
+ * Fetches annual cash flow statements.
+ * Called by FinancialsScreen and DCFScreen (for Free Cash Flow).
+ *
+ * ENDPOINT: /stable/cash-flow-statement?symbol=AAPL&limit=5
+ * Key fields: operatingCashFlow, capitalExpenditure (NEGATIVE), freeCashFlow
+ * (= operatingCashFlow + capitalExpenditure), dividendsPaid (NEGATIVE).
+ *
+ * FCF is the most important input to the DCF: it's the cash left after running
+ * and maintaining the business, which is what can repay debt or go to owners.
+ *
+ * @param {string} ticker Stock symbol.
+ * @returns {Promise<Object[]>} Yearly cash flow statements, newest first, or [].
+ */
+export const getCashFlow = (ticker) =>
+  fetchStatement('/cash-flow-statement', ticker, 'getCashFlow');
 
 
 // ============================================================
 // RATIOS AND METRICS
 // ============================================================
 
-// Fetches key valuation and financial metrics.
-// Called by: RatiosScreen.js
-//
-// ENDPOINT: /stable/key-metrics?symbol=AAPL&limit=1&apikey=KEY
-// (Old v3 endpoint was: /api/v3/key-metrics/AAPL?limit=1)
-//
-// limit=1 means "most recent year only." We don't need 5 years of
-// ratios for the Ratios screen since we display current values.
-//
-// KEY FIELDS:
-//   - peRatio: price-to-earnings ratio (stock price / EPS)
-//   - enterpriseValueOverEBITDA: EV/EBITDA (common valuation multiple)
-//   - pbRatio: price-to-book ratio
-//   - priceToSalesRatio: market cap / revenue
-//   - pegRatio: P/E divided by earnings growth rate
-//   - roic: return on invested capital (key profitability metric for PE)
-//   - evToSales: enterprise value / revenue
-//
-// NOTE: Some fields can be null for certain companies. Banks don't have
-// meaningful EBITDA (their "revenue" is interest income). REITs have
-// unusual capital structures. The RatiosScreen displays "N/A" for any
-// null value via the formatMultiple() and formatPercent() functions,
-// which both check for null before formatting.
+/**
+ * Fetches the most recent year of key metrics (limit=1, because the Ratios
+ * screen only shows current values).
+ *
+ * ENDPOINT: /stable/key-metrics?symbol=AAPL&limit=1
+ * Fields used (/stable/ names): evToEBITDA, evToSales, returnOnEquity,
+ * returnOnAssets, returnOnInvestedCapital.
+ * (P/E, P/B and P/S moved to /ratios in the /stable/ API.)
+ *
+ * Some fields are null for certain companies: banks have no meaningful
+ * EBITDA, REITs have unusual capital structures. The formatters show "N/A".
+ *
+ * @param {string} ticker Stock symbol.
+ * @returns {Promise<Object|null>} Latest metrics, or null on failure.
+ */
 export const getKeyMetrics = async (ticker) => {
   try {
-    const url = buildUrl('/key-metrics', `symbol=${ticker}&limit=1`);
-    const response = await axios.get(url);
-    if (response.data && response.data.length > 0) {
-      return response.data[0];
-    }
-    return null;
+    const response = await http.get(buildUrl('/key-metrics', `symbol=${encodeTicker(ticker)}&limit=1`));
+    return firstOrNull(response.data, 'getKeyMetrics');
   } catch (error) {
-    console.error('getKeyMetrics error:', error.message);
+    logError('getKeyMetrics', error);
     return null;
   }
 };
 
-// Fetches detailed financial ratios (profitability, leverage, efficiency).
-// Called by: RatiosScreen.js
-//
-// ENDPOINT: /stable/ratios?symbol=AAPL&limit=1&apikey=KEY
-// (Old v3 endpoint was: /api/v3/ratios/AAPL?limit=1)
-//
-// KEY FIELDS:
-//   - grossProfitMargin: gross profit / revenue (as a decimal, e.g., 0.43)
-//   - operatingProfitMargin: operating income / revenue
-//   - netProfitMargin: net income / revenue
-//   - returnOnAssets: net income / total assets
-//   - returnOnEquity: net income / shareholders' equity
-//   - debtEquityRatio: total debt / equity
-//   - debtRatio: total debt / total assets
-//   - interestCoverage: operating income / interest expense
-//   - currentRatio: current assets / current liabilities
-//   - quickRatio: (current assets - inventory) / current liabilities
-//   - assetTurnover: revenue / total assets
-//   - inventoryTurnover: cost of goods sold / average inventory
-//   - receivablesTurnover: revenue / average accounts receivable
-//
-// WHY TWO RATIO ENDPOINTS (key-metrics AND ratios):
-// FMP splits data across these two endpoints. /key-metrics has more
-// valuation-focused numbers (P/E, EV/EBITDA). /ratios has more
-// operational numbers (margins, turnover). The RatiosScreen fetches
-// both in parallel and combines them for a complete picture.
+/**
+ * Fetches the most recent year of financial ratios.
+ *
+ * ENDPOINT: /stable/ratios?symbol=AAPL&limit=1
+ * Fields used (/stable/ names): priceToEarningsRatio, priceToBookRatio,
+ * priceToSalesRatio, priceToEarningsGrowthRatio, grossProfitMargin,
+ * operatingProfitMargin, netProfitMargin, debtToEquityRatio, debtToAssetsRatio,
+ * interestCoverageRatio, currentRatio, quickRatio, assetTurnover,
+ * inventoryTurnover, receivablesTurnover.
+ *
+ * WHY TWO RATIO ENDPOINTS: FMP splits the data. /key-metrics is EV- and
+ * return-focused; /ratios has price multiples, margins and turnover.
+ * RatiosScreen fetches both in parallel and combines them.
+ *
+ * @param {string} ticker Stock symbol.
+ * @returns {Promise<Object|null>} Latest ratios, or null on failure.
+ */
 export const getRatios = async (ticker) => {
   try {
-    const url = buildUrl('/ratios', `symbol=${ticker}&limit=1`);
-    const response = await axios.get(url);
-    if (response.data && response.data.length > 0) {
-      return response.data[0];
-    }
-    return null;
+    const response = await http.get(buildUrl('/ratios', `symbol=${encodeTicker(ticker)}&limit=1`));
+    return firstOrNull(response.data, 'getRatios');
   } catch (error) {
-    console.error('getRatios error:', error.message);
+    logError('getRatios', error);
     return null;
   }
 };
@@ -375,78 +344,58 @@ export const getRatios = async (ticker) => {
 // HISTORICAL PRICES
 // ============================================================
 
-// Fetches daily closing prices for the stock price chart.
-// Called by: OverviewScreen.js (renders the 1-year line chart)
-//
-// ENDPOINT: /stable/historical-price-eod/full?symbol=AAPL&apikey=KEY
-// (Old v3 endpoint was: /api/v3/historical-price-full/AAPL?timeseries=365)
-//
-// RETURNS: Either:
-//   { symbol: "AAPL", historical: [ { date, open, high, low, close, volume }, ... ] }
-// or sometimes just a flat array of price objects depending on the endpoint version.
-// The function handles both formats.
-//
-// Each object in the historical array contains:
-//   - date: "2024-03-14" (trading date)
-//   - open: 172.50 (opening price)
-//   - high: 174.25 (highest price during the day)
-//   - low: 171.80 (lowest price)
-//   - close: 173.00 (closing price, this is what we chart)
-//   - volume: 54000000 (shares traded)
-//
-// DATA ORDER: NEWEST FIRST (most recent date at index 0).
-// The OverviewScreen reverses this array so the chart reads left-to-right
-// chronologically. It also samples every 7th data point to reduce ~252
-// trading days to ~36 points, which renders cleanly on a phone screen
-// without overcrowding the x-axis.
+/**
+ * Fetches daily end-of-day prices for the 1-year chart.
+ *
+ * ENDPOINT: /stable/historical-price-eod/full?symbol=AAPL
+ *
+ * The response is usually a flat array of { date, open, high, low, close,
+ * volume }, but older-style responses wrap it as { symbol, historical: [...] }.
+ * The old code only handled the flat array, so the wrapped shape silently
+ * produced an empty chart even though the comment said both were supported.
+ *
+ * DATA ORDER: NEWEST FIRST. OverviewScreen reverses and samples it.
+ *
+ * @param {string} ticker Stock symbol.
+ * @returns {Promise<Array<{date: string, close: number}>>} Daily prices, or [].
+ */
 export const getHistoricalPrice = async (ticker) => {
+  delete apiErrors.getHistoricalPrice;
   try {
-    const url = buildUrl('/historical-price-eod/full', `symbol=${ticker}`);
-    const response = await axios.get(url);
-    if (Array.isArray(response.data)) {
-      return response.data;
-    }
-    return [];
+    const response = await http.get(buildUrl('/historical-price-eod/full', `symbol=${encodeTicker(ticker)}`));
+    const { data } = response;
+    if (data && Array.isArray(data.historical)) return data.historical;
+    return asArray(data, 'getHistoricalPrice');
   } catch (error) {
-    console.error('getHistoricalPrice error:', error.message);
+    logError('getHistoricalPrice', error);
     return [];
   }
 };
+
+
 // ============================================================
 // ENTERPRISE VALUE (used by DCF calculator)
 // ============================================================
 
-// Fetches enterprise value data needed for the DCF calculation.
-// Called by: DCFScreen.js
-//
-// ENDPOINT: /stable/enterprise-value?symbol=AAPL&limit=1&apikey=KEY
-// (Old v3 endpoint was: /api/v3/enterprise-values/AAPL?limit=1)
-//
-// KEY FIELDS:
-//   - numberOfShares: total shares outstanding.
-//     This is the number the DCF calculator divides equity value by
-//     to get implied share price. Without it, you can't convert
-//     "this company's equity is worth $2.5 trillion" into
-//     "each share is worth $163."
-//   - enterpriseValue: market cap + total debt - cash.
-//     Useful for reference but the DCF calculates its own EV.
-//
-// WHY A SEPARATE ENDPOINT FOR SHARES:
-// The company profile endpoint sometimes includes shares outstanding
-// but it's not always reliable or present. The enterprise-value
-// endpoint consistently provides numberOfShares across companies.
-// Using a dedicated endpoint for a critical input to the DCF model
-// reduces the risk of a missing value breaking the calculation.
+/**
+ * Fetches enterprise-value data, mainly for the share count the DCF needs.
+ *
+ * ENDPOINT: /stable/enterprise-values?symbol=AAPL&limit=1
+ * Key fields: numberOfShares (divides equity value into a per-share price),
+ * enterpriseValue (reference only; the DCF calculates its own).
+ *
+ * WHY A SEPARATE ENDPOINT FOR SHARES: the profile endpoint doesn't reliably
+ * include shares outstanding, and without it the DCF can't produce a price.
+ *
+ * @param {string} ticker Stock symbol.
+ * @returns {Promise<Object|null>} Latest enterprise-value record, or null.
+ */
 export const getEnterpriseValue = async (ticker) => {
   try {
-    const url = buildUrl('/enterprise-values', `symbol=${ticker}&limit=1`);
-    const response = await axios.get(url);
-    if (response.data && response.data.length > 0) {
-      return response.data[0];
-    }
-    return null;
+    const response = await http.get(buildUrl('/enterprise-values', `symbol=${encodeTicker(ticker)}&limit=1`));
+    return firstOrNull(response.data, 'getEnterpriseValue');
   } catch (error) {
-    console.error('getEnterpriseValue error:', error.message);
+    logError('getEnterpriseValue', error);
     return null;
   }
 };

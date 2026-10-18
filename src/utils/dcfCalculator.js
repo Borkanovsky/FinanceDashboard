@@ -1,167 +1,158 @@
 // dcfCalculator.js
-// Contains the math for the Discounted Cash Flow valuation model.
-// This is the financial logic behind the DCF screen. The screen handles
-// UI (sliders, display). This file handles the math.
+// The math behind the DCF screen. The screen handles the UI (preset buttons,
+// display); this file only does the valuation math, so it can be tested on
+// its own without React.
 //
 // WHAT A DCF DOES (in plain English):
-// A company is worth the total of all cash it will generate in the future,
+// A company is worth the total of all the cash it will generate in the future,
 // adjusted for the fact that money today is worth more than money tomorrow.
-// The DCF model:
-// 1. Takes the company's current Free Cash Flow (FCF)
-// 2. Projects it forward for 5 years using an assumed growth rate
-// 3. Estimates what the company would sell for at the end of year 5
+// 1. Take the company's current Free Cash Flow (FCF)
+// 2. Project it forward 5 years using an assumed growth rate
+// 3. Estimate what the company would sell for at the end of year 5
 //    (the "terminal value") using an exit multiple
-// 4. Discounts all those future cash flows back to today's dollars
+// 4. Discount all of those future cash flows back to today's dollars
 //    using a discount rate (WACC)
-// 5. Adds them up to get Enterprise Value
-// 6. Subtracts net debt to get Equity Value
-// 7. Divides by shares outstanding to get Implied Share Price
+// 5. Add them up to get Enterprise Value
+// 6. Subtract net debt to get Equity Value
+// 7. Divide by shares outstanding to get the Implied Share Price
 //
 // WHY THIS MATTERS FOR PE:
-// PE firms use this exact model (with more complexity) to decide how much
-// to pay for a company. If the DCF says a company is worth $500M and
-// you can buy it for $400M, that's a potential investment. The DCF is
-// the single most important valuation tool in private equity.
+// PE firms use this same model (with more detail) to decide how much to pay
+// for a company. If the DCF says a company is worth $500M and you can buy it
+// for $400M, that's a potential investment.
 
-// Main DCF calculation function.
-//
-// PARAMETERS:
-// - currentFCF: number. The company's most recent annual Free Cash Flow
-//   in dollars. Pulled from the cash flow statement API response.
-//   Example: 111443000000 (Apple's FCF)
-//
-// - growthRate: number between 0 and 1. The annual rate at which you
-//   expect FCF to grow. 0.10 means 10% per year. The user adjusts this
-//   with a slider. Higher growth = higher valuation.
-//
-// - discountRate: number between 0 and 1. Also called WACC (Weighted
-//   Average Cost of Capital). Represents the minimum return investors
-//   require. 0.10 means 10%. Higher discount rate = LOWER valuation
-//   because future cash flows are worth less in today's dollars.
-//   Think of it as the "skepticism factor." More skepticism = higher
-//   discount rate = lower value.
-//
-// - terminalMultiple: number. The EV/FCF multiple used to estimate
-//   what the company would sell for at the end of the projection period.
-//   15 means "the company sells for 15 times its year-5 FCF." Higher
-//   multiple = higher terminal value = higher valuation.
-//
-// - netDebt: number. Total debt minus cash and equivalents. Subtracted
-//   from enterprise value to get equity value. If the company has more
-//   cash than debt, this is negative (which INCREASES equity value).
-//
-// - sharesOutstanding: number. Total shares. Used to convert total
-//   equity value into a per-share price for comparison with the market.
-//
-// RETURNS: An object with:
-// - projectedFCF: array of 5 numbers (projected FCF for each year)
-// - discountedFCF: array of 5 numbers (present value of each year's FCF)
-// - terminalValue: number (estimated sale price at end of year 5)
-// - discountedTerminalValue: number (terminal value in today's dollars)
-// - enterpriseValue: number (sum of discounted FCFs + discounted TV)
-// - equityValue: number (enterprise value minus net debt)
-// - impliedSharePrice: number (equity value divided by shares)
-// - totalPVofFCF: number (sum of just the discounted annual FCFs)
+/** Number of years we project cash flows before applying the terminal value. */
+const PROJECTION_YEARS = 5;
 
+/**
+ * @typedef {Object} DCFResult
+ * @property {number[]} projectedFCF        Projected FCF for years 1–5.
+ * @property {number[]} discountedFCF       Present value of each projected FCF.
+ * @property {number}   terminalValue       Estimated sale value at the end of year 5.
+ * @property {number}   discountedTerminalValue Terminal value in today's dollars.
+ * @property {number}   enterpriseValue     Sum of discounted FCFs + discounted terminal value.
+ * @property {number}   equityValue         Enterprise value minus net debt (can be negative).
+ * @property {number}   impliedSharePrice   Equity value per share, floored at 0.
+ * @property {number}   totalPVofFCF        Sum of the discounted annual FCFs only.
+ * @property {boolean}  isValid             False when inputs were missing/invalid and
+ *                                          the result is a zeroed placeholder.
+ */
+
+/**
+ * Builds the all-zero result returned when the inputs can't produce a
+ * meaningful valuation. Returning the same shape (instead of null) means the
+ * screen can always render the table without extra null checks.
+ *
+ * @returns {DCFResult}
+ */
+const emptyResult = () => ({
+  projectedFCF: Array(PROJECTION_YEARS).fill(0),
+  discountedFCF: Array(PROJECTION_YEARS).fill(0),
+  terminalValue: 0,
+  discountedTerminalValue: 0,
+  enterpriseValue: 0,
+  equityValue: 0,
+  impliedSharePrice: 0,
+  totalPVofFCF: 0,
+  isValid: false,
+});
+
+/**
+ * Runs a 5-year DCF using the exit-multiple method for terminal value.
+ *
+ * @param {number} currentFCF        Most recent annual Free Cash Flow in dollars
+ *                                   (e.g. 111443000000 for Apple). Must be non-zero.
+ * @param {number} growthRate        Annual FCF growth as a decimal (0.10 = 10%).
+ *                                   Higher growth → higher valuation.
+ * @param {number} discountRate      Discount rate / WACC as a decimal (0.10 = 10%).
+ *                                   Higher rate → LOWER valuation, because future cash
+ *                                   is worth less today. Think "skepticism factor."
+ * @param {number} terminalMultiple  EV/FCF exit multiple applied to year-5 FCF
+ *                                   (15 = "sells for 15× its year-5 FCF").
+ * @param {number} [netDebt=0]       Total debt minus cash. Negative when the company
+ *                                   holds more cash than debt, which RAISES equity value.
+ * @param {number} sharesOutstanding Share count used to convert equity value to a
+ *                                   per-share price. Must be > 0.
+ * @returns {DCFResult} The full valuation breakdown. `isValid` is false (and all
+ *                      numbers are 0) when any required input is missing or invalid.
+ *
+ * @example
+ * calculateDCF(100e9, 0.10, 0.10, 15, -50e9, 15e9).impliedSharePrice; // ≈ 136.67
+ */
 export const calculateDCF = (
   currentFCF,
   growthRate,
   discountRate,
   terminalMultiple,
-  netDebt,
+  netDebt = 0,
   sharesOutstanding
 ) => {
-  // Guard against invalid inputs that would produce NaN or Infinity.
-  // If any critical input is missing, return a zeroed-out result.
-  if (!currentFCF || !sharesOutstanding || sharesOutstanding === 0) {
-    return {
-      projectedFCF: [0, 0, 0, 0, 0],
-      discountedFCF: [0, 0, 0, 0, 0],
-      terminalValue: 0,
-      discountedTerminalValue: 0,
-      enterpriseValue: 0,
-      equityValue: 0,
-      impliedSharePrice: 0,
-      totalPVofFCF: 0,
-    };
-  }
+  // Guard against inputs that would silently produce NaN or Infinity.
+  // Number.isFinite rejects null, undefined, NaN, Infinity AND numeric strings,
+  // which the old `!value` check let through (e.g. growthRate = undefined made
+  // every projection NaN). A discount rate of -100% or lower would divide by
+  // zero or flip signs, so it's rejected too.
+  const inputsAreValid =
+    Number.isFinite(currentFCF) && currentFCF !== 0 &&
+    Number.isFinite(growthRate) &&
+    Number.isFinite(discountRate) && discountRate > -1 &&
+    Number.isFinite(terminalMultiple) &&
+    Number.isFinite(sharesOutstanding) && sharesOutstanding > 0;
 
-  const years = 5;
+  if (!inputsAreValid) return emptyResult();
+
+  // A missing net debt shouldn't kill the whole valuation; treating it as 0
+  // just means "assume debt and cash cancel out."
+  const safeNetDebt = Number.isFinite(netDebt) ? netDebt : 0;
+
   const projectedFCF = [];
   const discountedFCF = [];
 
-  // STEP 1: Project FCF forward for 5 years.
-  // Year 1 FCF = current FCF * (1 + growth rate)
-  // Year 2 FCF = Year 1 FCF * (1 + growth rate)
-  // Each year compounds on the previous year.
+  // STEP 1 + 2: Project each year's FCF, then discount it to today.
+  // Projection compounds from the current FCF:  FCF × (1 + g)^year
+  // Discounting reverses that with the WACC:     FCF_year / (1 + r)^year
   //
-  // EXAMPLE with FCF = $100B and growth = 10%:
-  // Year 1: $100B * 1.10 = $110B
-  // Year 2: $110B * 1.10 = $121B
-  // Year 3: $121B * 1.10 = $133.1B
-  // Year 4: $133.1B * 1.10 = $146.4B
-  // Year 5: $146.4B * 1.10 = $161.1B
-  for (let i = 1; i <= years; i++) {
-    const fcf = currentFCF * Math.pow(1 + growthRate, i);
+  // Why discount at all? $100 a year from now is worth less than $100 today,
+  // because today's $100 could be invested at r and grow. At r = 10%, $110
+  // next year is worth exactly $100 today. The further out the cash, the more
+  // the discount compounds.
+  //
+  // NOTE ON NEGATIVE FCF: if currentFCF < 0, "growth" makes the losses grow
+  // too, which drives the valuation down. That is mathematically consistent
+  // but usually not what an analyst intends for a cash-burning company, so the
+  // screen shows a warning in that case instead of hiding it here.
+  for (let year = 1; year <= PROJECTION_YEARS; year++) {
+    const fcf = currentFCF * Math.pow(1 + growthRate, year);
     projectedFCF.push(fcf);
+    discountedFCF.push(fcf / Math.pow(1 + discountRate, year));
   }
 
-  // STEP 2: Discount each projected FCF to present value.
-  // Present Value = Future Value / (1 + discount rate) ^ year
-  //
-  // WHY WE DISCOUNT:
-  // $100 a year from now is worth less than $100 today because you
-  // could invest $100 today and have $110 next year (at 10% return).
-  // So $100 next year is really worth about $90.91 today (100/1.10).
-  // The further into the future, the more the discount compounds.
-  //
-  // EXAMPLE with discount rate = 10%:
-  // Year 1: $110B / (1.10)^1 = $100B
-  // Year 2: $121B / (1.10)^2 = $100B
-  // Year 3: $133.1B / (1.10)^3 = $100B
-  // (In this example, 10% growth and 10% discount cancel out perfectly)
-  for (let i = 0; i < years; i++) {
-    const pv = projectedFCF[i] / Math.pow(1 + discountRate, i + 1);
-    discountedFCF.push(pv);
-  }
-
-  // Sum of discounted annual FCFs.
   const totalPVofFCF = discountedFCF.reduce((sum, val) => sum + val, 0);
 
-  // STEP 3: Calculate Terminal Value.
-  // This estimates what the company would be worth at the end of year 5.
-  // Terminal Value = Year 5 FCF * exit multiple
-  //
-  // WHY A TERMINAL VALUE:
-  // The company doesn't stop existing after year 5. It keeps generating
-  // cash forever (theoretically). The terminal value captures all that
-  // future value beyond your projection period in a single number.
-  // Using a multiple (e.g., 15x FCF) is the "exit multiple method,"
-  // which assumes you could sell the company at that multiple.
-  const terminalValue = projectedFCF[years - 1] * terminalMultiple;
+  // STEP 3: Terminal value (exit-multiple method).
+  // The company doesn't stop existing after year 5, so we capture everything
+  // beyond the projection window in one number: what a buyer would pay for it
+  // at the end of year 5, expressed as a multiple of that year's FCF.
+  const terminalValue = projectedFCF[PROJECTION_YEARS - 1] * terminalMultiple;
 
-  // STEP 4: Discount the Terminal Value to present.
-  // The terminal value occurs at the end of year 5, so we discount it
-  // back 5 years.
-  const discountedTerminalValue = terminalValue / Math.pow(1 + discountRate, years);
+  // STEP 4: The sale happens at the END of year 5, so it is discounted back
+  // the full 5 years, same as the year-5 cash flow.
+  const discountedTerminalValue = terminalValue / Math.pow(1 + discountRate, PROJECTION_YEARS);
 
-  // STEP 5: Enterprise Value = sum of discounted FCFs + discounted TV.
-  // This is the total value of the business (debt + equity).
+  // STEP 5: Enterprise value = value of the whole business (debt + equity claims).
   const enterpriseValue = totalPVofFCF + discountedTerminalValue;
 
-  // STEP 6: Equity Value = Enterprise Value - Net Debt.
-  // Enterprise value includes both debt holders' and equity holders' claims.
-  // Subtracting net debt gives you the value belonging to equity holders only.
-  //
-  // If net debt is negative (company has more cash than debt), this
-  // INCREASES equity value. Cash-rich companies like Apple get a boost here.
-  const equityValue = enterpriseValue - netDebt;
+  // STEP 6: Debt holders get paid before shareholders, so subtract net debt to
+  // isolate what belongs to equity holders. Cash-rich companies (negative net
+  // debt, like Apple) get a boost here.
+  const equityValue = enterpriseValue - safeNetDebt;
 
-  // STEP 7: Implied Share Price = Equity Value / Shares Outstanding.
-  // This is the number you compare to the current market price.
-  // If implied > market price, the model suggests the stock is undervalued.
-  // If implied < market price, the model suggests overvaluation.
-  const impliedSharePrice = equityValue / sharesOutstanding;
+  // STEP 7: Per-share value to compare against the market price.
+  // The share price is floored at 0 because a stock can't trade below zero
+  // (shareholders have limited liability). equityValue is intentionally NOT
+  // floored, so the summary table still shows a negative equity value
+  // honestly when debt exceeds the business's value.
+  const impliedSharePrice = Math.max(0, equityValue / sharesOutstanding);
 
   return {
     projectedFCF,
@@ -170,7 +161,8 @@ export const calculateDCF = (
     discountedTerminalValue,
     enterpriseValue,
     equityValue,
-    impliedSharePrice: Math.max(0, impliedSharePrice), // floor at 0
+    impliedSharePrice,
     totalPVofFCF,
+    isValid: true,
   };
 };
