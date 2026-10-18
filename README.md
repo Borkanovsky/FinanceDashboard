@@ -10,7 +10,7 @@ https://github.com/user-attachments/assets/9b3e882d-03c5-4fa2-be68-616744c9b078
 
 | Search | Overview | Ratios | DCF | sheets |
 |---|---|---|---| --- |
-| <img src="screenshots/search.png" width="200"> | <img src="screenshots/overview.png" width="200"> | <img src="screenshots/ratios.png" width="200"> | <img src="screenshots/dcf.png" width="200"> | <img src="screenshots/sheets.png" width="200"> 
+| <img src="screenshots/search.PNG" width="200"> | <img src="screenshots/overview.PNG" width="200"> | <img src="screenshots/ratios.PNG" width="200"> | <img src="screenshots/dcf.PNG" width="200"> | <img src="screenshots/sheets.PNG" width="200"> 
 
 ## Features
 
